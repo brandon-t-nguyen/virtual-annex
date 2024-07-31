@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+import subprocess as sp
+from pathlib import Path
+
+class Remote:
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+
+def print_usage():
+    print(f"usage: {sys.argv[0]}")
+
+"""
+Returns a list of the remotes as Remote objects
+"""
+def get_remotes_list():
+    remotes = []
+    res = sp.run(['git', 'remote'], capture_output=True, encoding='utf-8')
+    remote_names = res.stdout.strip().splitlines();
+    for name in remote_names:
+        path = Path(sp.run(['git', 'remote', 'get-url', name], capture_output=True, encoding='utf-8').stdout.strip())
+        remotes.append(Remote(name, path))
+    return remotes
+
+def convert_remotes_list_to_map(remotes_list):
+    return {r.name: r for r in remotes_list}
+
+def get_remotes_map():
+    return convert_remotes_list_to_map(get_remotes_list())
+
+
+"""
+Returns a map of annex file paths to a list of remotes
+It is the job of the caller to find the best remote
+"""
+def get_file_remotes_map(remotes_map):
+    listlines = sp.run(['git', 'annex', 'list'], capture_output=True, encoding='utf-8').stdout.strip().splitlines()
+
+    # slice the list based on whether it has the remotes or files
+    i = 0
+    for l in listlines:
+        if l.count('|') == len(l):
+            break
+        i += 1
+
+    remote_lines = listlines[1:i]
+    file_lines = listlines[i+1:]
+
+    # create a map of indicies of the list to remotes
+    # here is the 0th line
+    index_map = {}
+
+    # ignore 0, as it is 'here' and not used
+    i = 1
+    for l in remote_lines:
+        remote_name = l.strip('|')
+        # only use the ones we've specified
+        if remote_name in remotes_map:
+            index_map[i] = remotes_map[remote_name]
+        i += 1
+
+    # go through file list and see where each file is present
+    # generate a map of files
+    file_map = {}
+    for l in file_lines:
+        # split at first space; file paths may contain their own spaces
+        status, file = l.split(' ', 1)
+        remotes = []
+        for index, remote in index_map.items():
+            if status[index] == 'X':
+                remotes.append(remote)
+        file_map[file] = remotes
+
+    return file_map
+
+"""
+Returns list of remote (names), in ranking order (earlier == higher priority)
+Returns None if a ranking hasn't been generated yet
+"""
+def get_ranking(remotes_map):
+    ranking = []
+    try:
+        ranking_path = find_vannex_dir()/'ranking'
+        with open(ranking_path, 'r') as f:
+            for l in f.readlines():
+                remote_name = l.strip()
+                ranking.append(remotes_map[remote_name])
+    except FileNotFoundError as e:
+        return None
+    return ranking
+
+"""
+For a remotes list, file_remotes map, and ranking, return a map of
+annex files to the particular remote's link
+"""
+def get_link_map(remotes_list, file_map, ranking):
+    link_map = {}
+    # see if the highest ranking remote is a location of the file
+    for file, loc in file_map.items():
+        found = False
+        for r in ranking:
+            if r in loc:
+                link_map[file] = r.path/file
+                found = True
+                break
+        if not found:
+            print(f"File {file} not owned by any remote!")
+            return None
+
+    return link_map
+
+def link_annexes(link_map):
+    repo_root = find_vannex_dir().parent.parent
+
+    for file, source_path in link_map.items():
+        link_path = repo_root/file
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not link_path.exists(follow_symlinks=False):
+            link_path.symlink_to(source_path)
+        else:
+            # if it already exists replace if the target is different
+            if link_path.resolve() != source_path.resolve():
+                # if it exists, we need to update it
+                # the tmp link is to avoid any races
+                tmp_path = link_path.parent / (link_path.name + '.tmp')
+                tmp_path.symlink_to(source_path)
+                tmp_path.replace(link_path)
+
+"""
+Finds the .git/vannex directory
+"""
+def find_vannex_dir():
+    d = Path.cwd()
+    while True:
+        vannex_dir = d/'.git'/'vannex'
+        if vannex_dir.exists():
+            return vannex_dir
+        else:
+            if d.parent == d.root:
+                return None
+            else:
+                d = d.parent
+
+"""
+Prints out error vannex
+"""
+def not_vannex():
+    print("Not a vannex-managed Git repository", file=sys.stderr)
+    return 1
+
+"""
+Initializes Git and git-annex in the current directory
+"""
+def cmd_init(args):
+    sp.run(['git', 'init'])
+    sp.run(['git', 'annex', 'init', 'virtual'])
+    sp.run(['mkdir', '.git/vannex'])
+
+"""
+Specifies a remote annex, disables pushing
+"""
+def cmd_remote(args):
+    if find_vannex_dir() == None: return not_vannex()
+    res = sp.run(['git', 'remote', 'add', args.name, args.path], capture_output=True, encoding='utf-8')
+    if res.returncode == 3:
+        # return 3 means it already exists; that's fine
+        # redirect the fetch to the specified path
+        res = sp.run(['git', 'remote', 'set-url', args.name, args.path])
+    elif res.returncode != 0:
+        print("Could not set the remote, error message from Git:", file=sys.stderr)
+        print("'git remote add' " + res.stderr.strip(), file=sys.stderr)
+        return res.returncode
+    # "disables" pushing by providing a bogus path
+    # should work as long as there's no path called '__no_push__', fingers crossed
+    res = sp.run(['git', 'remote', 'set-url', '--push', args.name, '__no_push__'])
+
+
+def parse_dd_speed(dd_out):
+    # grab the last bit with the average speed
+    # e.g. ['10', 'GB/s']
+    rate_parts = line.split(',')[-1].strip().split()
+    speed = float(rate_parts[0])
+    if rate_parts[1] == 'TB/s':
+        speed *= 1024*1024*1024*1024
+    elif rate_parts[1] == 'GB/s':
+        speed *= 1024*1024*1024
+    elif rate_parts[1] == 'MB/s':
+        speed *= 1024*1024
+    elif rate_parts[1] == 'KB/s':
+        speed *= 1024
+
+def parse_dd_latency(dd_out):
+    # ignore the first 2 lines with
+    line = dd_out.splitlines()[2]
+
+    # get the latency
+    # e.g. ['1.543', 's']
+    # assuming it'll be seconds; don't want the simple test to take too long
+    latency_parts = line.split(',')[-2].strip().split()
+    latency = float(latency_parts[0])
+    return latency
+
+# ultra naive
+def score_simple(path):
+    benchpath = path/'vannex.bench'
+    # delete if already there
+    benchpath.unlink(missing_ok=True)
+    # write test
+    # for simplicity, don't bother with read test so we can shove the
+    # issue of cached reads under the rug :)
+    res = sp.run(['dd', 'if=/dev/zero', f'of={benchpath}', 'bs=1M', 'count=1024', 'count=1024', 'conv=fdatasync,notrunc'],
+           capture_output=True, encoding='utf-8')
+    latency = parse_dd_latency(res.stderr.strip())
+
+    # delete the benchfile
+    benchpath.unlink(missing_ok=True)
+    return latency
+
+
+"""
+Returns a sorted list of remotes by read speed
+"""
+def sort_remotes_simple(remotes_list):
+    scores = []
+    n = 3;
+    for remote in remotes_list:
+        print(f"Testing remote '{remote.name}'", file=sys.stderr)
+        # perform a test
+        total = 0;
+        for i in range(0,n):
+            print(f"- run {i+1}", file=sys.stderr)
+            total += score_simple(remote.path)
+        # calculate score
+        score = total/n
+        print(f"  score: {score}", file=sys.stderr)
+        scores.append((score, remote))
+    # sorted will go to low to high, which we want for latency
+    return [score[1] for score in sorted(scores, key=lambda r:r[0], reverse=False)]
+
+
+"""
+Generates a ranking file
+"""
+def cmd_generate_ranking(args):
+    if find_vannex_dir() == None: return not_vannex()
+
+    vannex_dir = find_vannex_dir()
+    ranking_path = vannex_dir/'ranking'
+    remotes_list = get_remotes_list()
+    # TODO: implement sorting functions
+    if args.sort == 'alpha':
+        ranked_remotes_list = sorted(remotes_list, key=lambda r: r.name)
+    elif args.sort == 'simple':
+        ranked_remotes_list = sort_remotes_simple(remotes_list)
+
+    with open(ranking_path, 'w') as f:
+        for r in ranked_remotes_list:
+            f.write(r.name)
+            f.write('\n')
+
+"""
+Performs the linking process
+"""
+def cmd_link(args):
+    if find_vannex_dir() == None: return not_vannex()
+
+    remotes_list = get_remotes_list()
+    remotes_map = convert_remotes_list_to_map(remotes_list)
+    file_remotes_map = get_file_remotes_map(remotes_map)
+    ranking = get_ranking(remotes_map)
+    link_map = get_link_map(remotes_list, file_remotes_map, ranking)
+    link_annexes(link_map)
+
+"""
+Drops the links, syncs with the remotes, and reapplies the links
+"""
+def cmd_sync(args):
+    if find_vannex_dir() == None: return not_vannex()
+
+    sp.run(['git', 'restore', ':/'])
+    sp.run(['git', 'annex', 'sync'])
+    cmd_link(args)
+
+def main():
+    parser = argparse.ArgumentParser(
+                prog='vannex',
+                description="Virtual annex generator for git-annex")
+
+    subparsers = parser.add_subparsers(title="subcommands", dest='subcommand', required=True)
+
+    # init
+    parser_init = subparsers.add_parser('init')
+
+    # remote
+    parser_remote = subparsers.add_parser('remote')
+    parser_remote.add_argument('name', type=str, help="the remote name for this annex")
+    parser_remote.add_argument('path', type=str, help="the path to for this remote annex")
+
+    # rank
+    parser_rank = subparsers.add_parser('rank')
+    parser_rank.add_argument('-s', '--sort', type=str, choices=['alpha', 'simple'], default='alpha')
+
+    # sync
+    parser_sync = subparsers.add_parser('sync')
+
+    # sync
+    parser_link = subparsers.add_parser('link')
+
+    args = parser.parse_args()
+    subcommands_map = {
+        'init': cmd_init,
+        'remote': cmd_remote,
+        'rank': cmd_generate_ranking,
+        'sync': cmd_sync,
+        'link': cmd_link,
+    }
+
+    return subcommands_map[args.subcommand](args)
+
+
+if __name__ == '__main__':
+    exit(main())

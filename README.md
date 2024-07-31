@@ -7,10 +7,8 @@ out the preferred source of the file.
 This is done through a file that lists each remote in order of preferrence. Planned is a tool to benchmark the annexes
 to generating this ranking file.
 
-Currently running this script requires you to refer to a "master" annex which is assumed to be on the fastest storage
-available and thus has the highest precedence when linking files, and creates symlinks in another directory you specify.
-
-The next iteration of this is to have it work with a separate, gateway repository (to borrow the term from clusters).
+This uses a separate repository to act as a sort of switchboard to find the files, co-opting Git's and git-annex's
+infrastructure. This also has an simple I/O benchmark to sort remotes.
 This repository will be a node that has each other annex as a remote, keeps in sync with them to keep up to date with
 new files, and then apply its links on a separate branch.
 
