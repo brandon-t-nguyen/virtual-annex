@@ -94,7 +94,7 @@ def link_annexes(target_dir, link_map):
         link_path = target_dir/file
         link_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not link_path.exists():
+        if not link_path.exists(follow_symlinks=False):
             link_path.symlink_to(source_path)
         else:
             # if it already exists replace if the target is different
