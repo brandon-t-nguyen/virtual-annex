@@ -195,7 +195,7 @@ def parse_dd_speed(dd_out):
 
 def parse_dd_latency(dd_out):
     # ignore the first 2 lines with
-    line = dd_out.splitlines()[2]
+    line = dd_out.splitlines()[-1]
 
     # get the latency
     # e.g. ['1.543', 's']
@@ -203,6 +203,57 @@ def parse_dd_latency(dd_out):
     latency_parts = line.split(',')[-2].strip().split()
     latency = float(latency_parts[0])
     return latency
+
+def score_read_write(path):
+    benchpath = path/'vannex.bench'
+    # delete if already there
+    benchpath.unlink(missing_ok=True)
+    # write test
+    # for simplicity, don't bother with read test so we can shove the
+    # issue of cached reads under the rug :)
+    res = sp.run(['dd', 'if=/dev/zero', f'of={benchpath}',
+                  'oflag=nocache', 'bs=1M', 'count=1024',
+                  'conv=fdatasync,notrunc'],
+           capture_output=True, encoding='utf-8')
+    w_latency = parse_dd_latency(res.stderr.strip())
+
+    # do a single unused run to make sure the cache is dropped
+    res = sp.run(['dd', f'if={benchpath}', f'of=/dev/null',
+                  'iflag=nocache', 'bs=1M', 'count=1024',
+                  'conv=notrunc'],
+           capture_output=True, encoding='utf-8')
+
+    res = sp.run(['dd', f'if={benchpath}', f'of=/dev/null',
+                  'iflag=nocache', 'bs=1M', 'count=1024',
+                  'conv=notrunc'],
+           capture_output=True, encoding='utf-8')
+    r_latency = parse_dd_latency(res.stderr.strip())
+
+    # delete the benchfile
+    benchpath.unlink(missing_ok=True)
+    return r_latency, w_latency
+
+"""
+Returns a sorted list of remotes by weighting read and write latency
+"""
+def sort_remotes_weighted_read_write(remotes_list, read_weight = 0.75):
+    write_weight = 1 - read_weight
+    scores = []
+    n = 5;
+    for remote in remotes_list:
+        print(f"Testing remote '{remote.name}'", file=sys.stderr)
+        # perform a test
+        total = 0;
+        for i in range(0,n):
+            print(f"- run {i+1}", file=sys.stderr)
+            r, w = score_read_write(remote.path)
+            total += (r * read_weight) + (w * write_weight)
+        # calculate score
+        score = total/n
+        print(f"  score: {score}", file=sys.stderr)
+        scores.append((score, remote))
+    # sorted will go to low to high, which we want for latency
+    return [score[1] for score in sorted(scores, key=lambda r:r[0], reverse=False)]
 
 # ultra naive
 def score_simple(path):
@@ -212,7 +263,7 @@ def score_simple(path):
     # write test
     # for simplicity, don't bother with read test so we can shove the
     # issue of cached reads under the rug :)
-    res = sp.run(['dd', 'if=/dev/zero', f'of={benchpath}', 'bs=1M', 'count=1024', 'count=1024', 'conv=fdatasync,notrunc'],
+    res = sp.run(['dd', 'if=/dev/zero', f'of={benchpath}', 'bs=1M', 'count=1024', 'conv=fdatasync,notrunc'],
            capture_output=True, encoding='utf-8')
     latency = parse_dd_latency(res.stderr.strip())
 
@@ -226,7 +277,7 @@ Returns a sorted list of remotes by read speed
 """
 def sort_remotes_simple(remotes_list):
     scores = []
-    n = 3;
+    n = 5;
     for remote in remotes_list:
         print(f"Testing remote '{remote.name}'", file=sys.stderr)
         # perform a test
@@ -256,6 +307,8 @@ def cmd_generate_ranking(args):
         ranked_remotes_list = sorted(remotes_list, key=lambda r: r.name)
     elif args.sort == 'simple':
         ranked_remotes_list = sort_remotes_simple(remotes_list)
+    elif args.sort == 'weighted':
+        ranked_remotes_list = sort_remotes_weighted_read_write(remotes_list)
 
     with open(ranking_path, 'w') as f:
         for r in ranked_remotes_list:
@@ -302,7 +355,7 @@ def main():
 
     # rank
     parser_rank = subparsers.add_parser('rank')
-    parser_rank.add_argument('-s', '--sort', type=str, choices=['alpha', 'simple'], default='alpha')
+    parser_rank.add_argument('-s', '--sort', type=str, choices=['alpha', 'simple', 'weighted'], default='alpha')
 
     # sync
     parser_sync = subparsers.add_parser('sync')
